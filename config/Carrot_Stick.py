@@ -14,7 +14,7 @@ def compute_evader_reward(
         reward += 10 * (prev_goal_dist - goal_dist)
 
     if E_2_C_pos < 1.0: # What distance is "unsafe"
-        reward += -0.1 * (E_2_C_pos)
+        reward += -100 / (E_2_C_pos)
 
     if info["evader_reached_goal"]:
         reward += 100
@@ -23,7 +23,13 @@ def compute_evader_reward(
         reward += -100
 
     if info["evader_out"]:
-        reward += -100
+        reward += -1000
+    if info["evader_collision"]:
+        reward += -1000
+
+    # Time penalty
+    reward -= 0.05
+
 
     return float(reward)
 
@@ -31,7 +37,6 @@ def compute_chaser_reward(
     E_2_C_distance: float,
     prev_E_2_C_distance: float | None,
     info: dict,
-    cfg: RewardConfig,
 ) -> float:
     reward = 0.0
 
@@ -45,6 +50,11 @@ def compute_chaser_reward(
         reward += -100
 
     if info["chaser_out"]:
-        reward += -100
+        reward += -1000
+    
+    if info["chaser_collision"]:
+        reward += -1000
+    # Time penalty
+    reward -= 0.05
 
     return float(reward)

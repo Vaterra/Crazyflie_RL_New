@@ -1,94 +1,77 @@
 import numpy as np
 import pybullet as p
 
-class RaySensor:
-    def __init__(self, num_rays=4, max_range=3.0, use_3d=False, z_levels=None):
-        self.num_rays = num_rays
-        self.max_range = max_range
-        self.use_3d = use_3d
 
-        if z_levels is None:
-            z_levels = [-0.3, 0.0, 0.3] if use_3d else [0.0]
-        self.z_levels = z_levels
+def RaySensor(drone_id, client_id=0, max_range=5.0, visualize=False):
+    """
+    Cast 4 rays 90 degrees apart from the drone in its local XY plane.
 
-        self.local_dirs = self._build_local_directions()
+    Returns:
+        np.ndarray of shape (4,) with distances in meters.
+        If a ray hits nothing, its distance is max_range.
+    """
 
-    def _build_local_directions(self):
-        dirs = []
-        for z in self.z_levels:
-            for i in range(self.num_rays):
-                yaw = 2.0 * np.pi * i / self.num_rays
-                d = np.array([np.cos(yaw), np.sin(yaw), z], dtype=np.float32)
-                d = d / np.linalg.norm(d)
-                dirs.append(d)
-        return np.array(dirs, dtype=np.float32)
+    # Get drone world position and orientation
+    pos, orn = p.getBasePositionAndOrientation(drone_id, physicsClientId=client_id)
+    pos = np.array(pos, dtype=np.float32)
 
-    def get_observation(
-        self,
-        drone_id,
-        client_id=0,
-        visualize=False,
-        ignore_body_ids=None,
-        return_hits=True,
-    ):
-        if ignore_body_ids is None:
-            ignore_body_ids = set()
+    # Rotation matrix from drone local frame -> world frame
+    rot = np.array(
+        p.getMatrixFromQuaternion(orn, physicsClientId=client_id),
+        dtype=np.float32
+    ).reshape(3, 3)
+
+    # 4 local ray directions: forward, left, back, right
+    local_dirs = np.array([
+        [ 1.0,  0.0, 0.0],   # forward
+        [ 0.0,  1.0, 0.0],   # left
+        [-1.0,  0.0, 0.0],   # back
+        [ 0.0, -1.0, 0.0],   # right
+    ], dtype=np.float32)
+
+    # Rotate local directions into world frame
+    world_dirs = (rot @ local_dirs.T).T
+
+    # Start rays slightly outside the drone body to avoid self-hit
+    ray_start_offset = 0.1
+    ray_length = max_range - ray_start_offset
+
+    ray_from = pos[None, :] + ray_start_offset * world_dirs
+    ray_to = ray_from + ray_length * world_dirs
+
+    # Batch raycast
+    results = p.rayTestBatch(
+        ray_from.tolist(),
+        ray_to.tolist(),
+        physicsClientId=client_id
+    )
+
+    distances = np.empty(4, dtype=np.float32)
+
+    for i, r in enumerate(results):
+        hit_body_uid = r[0]
+        hit_fraction = r[2]
+        hit_position = np.array(r[3], dtype=np.float32)
+
+        if hit_body_uid == -1:
+            # No hit within range
+            distances[i] = max_range
+            end_pt = ray_to[i]
+            color = [0, 1, 0]
         else:
-            ignore_body_ids = set(ignore_body_ids)
+            # Hit something
+            dist = ray_start_offset + hit_fraction * ray_length
+            distances[i] = min(dist, max_range)
+            end_pt = hit_position
+            color = [1, 0, 0]
 
-        pos, orn = p.getBasePositionAndOrientation(drone_id, physicsClientId=client_id)
-        pos = np.array(pos, dtype=np.float32)
+        if visualize:
+            p.addUserDebugLine(
+                ray_from[i].tolist(),
+                end_pt.tolist(),
+                color,
+                lifeTime=0.05,
+                physicsClientId=client_id
+            )
 
-        rot = np.array(
-            p.getMatrixFromQuaternion(orn, physicsClientId=client_id),
-            dtype=np.float32
-        ).reshape(3, 3)
-
-        world_dirs = (rot @ self.local_dirs.T).T
-
-        ray_start_offset = 0.05
-        ray_from = pos + ray_start_offset * world_dirs
-        ray_to = pos + self.max_range * world_dirs
-
-        results = p.rayTestBatch(
-            ray_from.tolist(),
-            ray_to.tolist(),
-            physicsClientId=client_id
-        )
-
-        distances = []
-        hits = []
-
-        for i, r in enumerate(results):
-            hit_body_uid = r[0]
-            hit_fraction = r[2]
-            hit_position = np.array(r[3], dtype=np.float32)
-
-            if hit_body_uid == -1 or hit_body_uid in ignore_body_ids:
-                dist = self.max_range
-                hit = 0.0
-                end_pt = ray_to[i]
-            else:
-                dist = hit_fraction * self.max_range
-                hit = 1.0
-                end_pt = hit_position
-
-            distances.append(dist)
-            hits.append(hit)
-
-            if visualize:
-                color = [1, 0, 0] if hit else [0, 1, 0]
-                p.addUserDebugLine(
-                    ray_from[i],
-                    end_pt,
-                    color,
-                    lifeTime=0.05,
-                    physicsClientId=client_id
-                )
-
-        distances = np.array(distances, dtype=np.float32) / self.max_range
-        hits = np.array(hits, dtype=np.float32)
-
-        if return_hits:
-            return np.concatenate([distances, hits], axis=0)
-        return distances
+    return distances

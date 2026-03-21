@@ -1,0 +1,263 @@
+import os
+import random
+import numpy as np
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_checker import check_env
+
+from envs.environment import base_aviary
+
+
+from policies.policy_wrapper import PolicyEntry, LazyPPOPolicy
+from policies.scripted_policies import ScriptedChaserPolicy, ScriptedEvaderPolicy
+from utils.vec_env_builder import build_vec_env
+from config.sim_config import EnvConfig
+from config.train_config import TrainConfig, timestamp
+from config.eval_scenarios import EVAL_SCENARIOS
+
+
+
+import gc
+import torch
+
+
+# =============================================================================
+# Training helpers
+# =============================================================================
+
+def save_model(model: PPO, save_dir: str, name: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, name)
+    model.save(path)
+    if not path.endswith(".zip"):
+        path += ".zip"
+    return path
+
+
+def train_from(
+    agent_role: str,                  # "evader" or "chaser"
+    init_policy_path: str | None,
+    opponent_pool: list,
+    training: TrainConfig,
+    seed_input: int,
+    scenario_name: str | None,
+):
+    
+    if agent_role not in ["evader", "chaser"]:
+        raise ValueError(f"Unknown agent_role={agent_role}")
+
+    controlled_agent = (
+        base_aviary.AGENT_EVADER if agent_role == "evader"
+        else base_aviary.AGENT_CHASER
+    )
+
+    env = build_vec_env(
+        controlled_agent=controlled_agent,
+        n_envs=training.n_envs,
+        seed= seed_input,
+        opponent_pool=opponent_pool,
+        p_old=training.p_old,
+        scenario=scenario_name,
+    )
+
+    #Tensorboard logging setup
+    tb_log = os.path.join(training.tb_root, agent_role, training.Version)
+    tb_name = f"{agent_role}_seed_{seed_input}"
+
+    try:
+        if init_policy_path is None:
+            model = PPO(
+                "MlpPolicy",
+                env,
+                verbose=training.verbose,
+                learning_rate=training.learning_rate,
+                n_steps=training.n_steps,
+                batch_size=training.batch_size,
+                gamma=training.gamma,
+                device=training.device,
+                tensorboard_log=tb_log,
+            )
+            reset_num_timesteps = True
+        else:
+            model = PPO.load(
+                init_policy_path,
+                env=env,
+                device=training.device,
+            )
+            model.tensorboard_log = tb_log
+            reset_num_timesteps = False
+
+        model.learn(
+            total_timesteps=training.total_timesteps,
+            tb_log_name=tb_name,
+            reset_num_timesteps=reset_num_timesteps,
+        )
+
+        run_stamp = timestamp()
+        save_name = f"{agent_role}_seed_{seed_input}_{run_stamp}"
+        save_path = save_model(model, training.save_dir, save_name)
+
+    finally:
+        if "model" in locals():
+            del model
+        if "env" in locals():
+            env.close()
+            del env
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return save_path
+
+# =============================================================================
+# AMSPB
+# =============================================================================
+
+def AMSPB(
+    train_cfg: TrainConfig,
+    env_config: EnvConfig,
+    scenario: str | None = None
+):
+
+    random.seed(train_cfg.seed)
+    np.random.seed(train_cfg.seed)
+
+    evader_seed = train_cfg.seed
+    chaser_seed = train_cfg.seed  + 1
+
+    # -------------------------------------------------------------------------
+    # Initial scripted pools
+    # Pi_P = pursuer/chaser pool
+    # Pi_E = evader pool
+    # -------------------------------------------------------------------------
+    Pi_P = [
+        PolicyEntry(
+            policy=ScriptedChaserPolicy(speed=1.0),
+            name="scripted_chaser",
+            kind="scripted",
+        )
+    ]
+
+    Pi_E = [
+        PolicyEntry(
+            policy=ScriptedEvaderPolicy(speed=1.0, w_goal=0.7, w_away=0.3),
+            name="scripted_evader",
+            kind="scripted",
+        )
+    ]
+
+    # -------------------------------------------------------------------------
+    # Stage 0: train first chaser against scripted evader pool
+    # -------------------------------------------------------------------------
+    print("\n=== Stage 0: Train chaser against scripted evader pool ===")
+    pi_P_0_path = train_from(
+        agent_role="chaser",
+        init_policy_path=None,
+        opponent_pool=[entry.policy for entry in Pi_E],
+        training=train_cfg,
+        seed_input=chaser_seed,
+        scenario_name=scenario,
+
+    )
+
+    Pi_P.append(
+        PolicyEntry(
+            policy=LazyPPOPolicy(pi_P_0_path, device=train_cfg.device),
+            name="pi_P_0",
+            kind="learned",
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Stage 0: train first evader against current chaser pool
+    # -------------------------------------------------------------------------
+    print("\n=== Stage 0: Train evader against current chaser pool ===")
+    pi_E_0_path = train_from(
+        agent_role="evader",
+        init_policy_path=None,
+        opponent_pool=[entry.policy for entry in Pi_P],
+        training=train_cfg,
+        seed_input=evader_seed,
+        scenario_name=scenario,
+    )
+
+    Pi_E.append(
+        PolicyEntry(
+            policy=LazyPPOPolicy(pi_E_0_path, device=train_cfg.device),
+            name="pi_E_0",
+            kind="learned",
+        )
+    )
+    prev_evader_path = pi_E_0_path
+    prev_chaser_path = pi_P_0_path
+
+    # -------------------------------------------------------------------------
+    # Adversarial cross-training
+    # -------------------------------------------------------------------------
+    if train_cfg.N > 0:
+        print("\n=== Starting AMSPB Training ===")
+        for k in range(1, train_cfg.N + 1):
+            print(f"\n========== AMSPB Stage {k}/{train_cfg.N} ==========\n")
+
+            print(f"Training evader pi_E_{k} from {prev_evader_path}")
+            pi_E_k_path = train_from(
+                agent_role="evader",
+                init_policy_path=prev_evader_path,
+                opponent_pool=[entry.policy for entry in Pi_P],
+                training=train_cfg,
+                seed_input=evader_seed + 2*k,
+                scenario_name=scenario,
+            )
+
+            Pi_E.append(
+                PolicyEntry(
+                    policy=LazyPPOPolicy(pi_E_k_path, device=train_cfg.device),
+                    name=f"pi_E_{k}",
+                    kind="learned",
+                )
+            )
+
+            print(f"Training chaser pi_P_{k} from {prev_chaser_path}")
+            pi_P_k_path = train_from(
+                agent_role="chaser",
+                init_policy_path=prev_chaser_path,
+                opponent_pool=[entry.policy for entry in Pi_E],
+                training=train_cfg,
+                seed_input=chaser_seed + 2*k-1,
+                scenario_name=scenario,
+            )
+
+            Pi_P.append(
+                PolicyEntry(
+                    policy=LazyPPOPolicy(pi_P_k_path, device=train_cfg.device),
+                    name=f"pi_P_{k}",
+                    kind="learned",
+                )
+            )
+
+            prev_evader_path = pi_E_k_path
+            prev_chaser_path = pi_P_k_path
+
+        print("\nAMSPB training complete.")
+    else: 
+        print("\nAMSPB training complete. (No adversarial stages, N=0)")
+    return Pi_E, Pi_P
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    Settings = TrainConfig()
+    Env = EnvConfig
+
+    scenario_full = None
+    if Env.scenario is not None:
+        scenario_full = next(
+            (s for s in EVAL_SCENARIOS if s.name == Env.scenario),
+            None
+        )
+        if scenario_full is None:
+            raise ValueError(f"Unknown scenario: {Env.scenario}")
+            
+    AMSPB(train_cfg=Settings, env_config=Env, scenario=scenario_full)

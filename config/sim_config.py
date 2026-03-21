@@ -7,8 +7,6 @@ from gym_pybullet_drones.utils.enums import (
     ObservationType,
 )
 
-from envs.candy_function import RewardConfig
-
 
 @dataclass
 class EnvConfig:
@@ -16,7 +14,7 @@ class EnvConfig:
     drone_model: DroneModel = DroneModel.CF2X
     physics: Physics = Physics.PYB
     pyb_freq: int = 240
-    ctrl_freq: int = 30
+    ctrl_freq: int = 240
     gui: bool = False
     record: bool = False
     obs: ObservationType = ObservationType.KIN
@@ -31,12 +29,18 @@ class EnvConfig:
     arena_z_max: float = 3.0
     opponent_speed: float = 1.0
     speed_limit: float = 1.0
-    reward_config: RewardConfig = field(default_factory=RewardConfig)
 
     # Ray sensor parameters
-    use_ray_sensor: bool = True
-    ray_num_rays: int = 4
-    ray_max_range: float = 3.0
-    ray_use_3d: bool = False
-    ray_z_levels: list[float] = field(default_factory=lambda: [0.0])
-    ray_include_hits: bool = True
+    use_raycast: bool = True
+    if use_raycast:
+        max_range: float = 5.0
+        vizualise: bool = False
+
+    fixed_spawns: bool = False
+    
+    # Scenario to train
+    #scenario = "single_wall_middle"
+    scenario: str = "three_pillars_corridor"
+    #scenario = "Double_diamond"
+    #scenario = "maze_like"
+    #scenario = "open_field_easy"
